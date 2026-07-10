@@ -1,0 +1,154 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+// ── 會員與偏好 ─────────────────────────────────────────
+
+model User {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String   @unique
+  passwordHash  String?  // 後續交給 Supabase Auth 管理
+  baseCurrency  String   @default("TWD") // 系統主基準幣別
+
+  banks             Bank[]
+  netWorthSnapshots NetWorthSnapshot[]
+}
+
+// ── 行情與匯率快取 ───────────────────────────────────────
+
+model ExchangeRate {
+  id             Int      @id @default(autoincrement())
+  fromCurrency   String
+  toCurrency     String
+  rate           Decimal  @db.Decimal(12, 6)
+  lastUpdatedAt  DateTime @updatedAt
+
+  @@unique([fromCurrency, toCurrency])
+}
+
+model MarketQuote {
+  ticker          String   @id
+  currentPrice    Decimal  @db.Decimal(18, 6)
+  currency        String
+  dataSource      String   @default("YAHOO") 
+  lastUpdatedAt   DateTime @updatedAt
+}
+
+// ── 帳戶與實體 ─────────────────────────────────────────
+
+model Bank {
+  id       Int           @id @default(autoincrement())
+  userId   String        @db.Uuid
+  name     String
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accounts CashAccount[]
+}
+
+model CashAccount {
+  id       Int    @id @default(autoincrement())
+  bankId   Int
+  currency String // 交割帳戶幣別 (例: TWD, USD, JPY)
+
+  bank     Bank   @relation(fields: [bankId], references: [id], onDelete: Cascade)
+
+  cashTransactions  CashTransaction[]
+  stockTransactions StockTransaction[]
+  marginLoans       MarginLoan[]
+  transfersFrom     Transfer[] @relation("TransferFrom")
+  transfersTo       Transfer[] @relation("TransferTo")
+  snapshots         NetWorthSnapshot[]
+}
+
+// ── 交易與流水帳 ─────────────────────────────────────────
+
+model CashTransaction {
+  id        Int      @id @default(autoincrement())
+  accountId Int
+  date      DateTime @db.Date
+  type      String   // 期初入金 / 入金 / 出金
+  amount    Decimal  @db.Decimal(18, 4)
+  note      String?
+
+  account   CashAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+model StockTransaction {
+  id                 Int      @id @default(autoincrement())
+  accountId          Int      // 關聯的交割帳戶 (決定扣款幣別)
+  date               DateTime @db.Date
+  action             String   // 期初建倉 / 買入 / 賣出
+  ticker             String   // 股票代號
+  assetCurrency      String   // 標的原生幣別 (例: USD)
+  price              Decimal  @db.Decimal(18, 6) // 原生幣別價格
+  shares             Decimal  @db.Decimal(18, 6)
+  settlementFxRate   Decimal  @db.Decimal(12, 6) @default(1.0) // 交割匯率
+  fee                Decimal  @db.Decimal(18, 4) @default(0.0) // 依交割幣別計費
+  tradeType          String   @default("CASH") // CASH(現股) 或 MARGIN(融資)
+  marginLoanId       Int?
+  note               String?
+
+  account    CashAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  marginLoan MarginLoan? @relation(fields: [marginLoanId], references: [id], onDelete: SetNull)
+}
+
+model MarginLoan {
+  id               Int      @id @default(autoincrement())
+  accountId        Int
+  ticker           String
+  loanCurrency     String   // 借款計價幣別 (例: JPY)
+  loanAmount       Decimal  @db.Decimal(18, 4) // 券商借你的錢
+  selfPaidAmount   Decimal  @db.Decimal(18, 4) // 你自己出的錢
+  loanShares       Decimal  @db.Decimal(18, 6)
+  interestRate     Decimal  @db.Decimal(8, 6)  // 年利率
+  accruedInterest  Decimal  @db.Decimal(18, 4) @default(0.0)
+  status           String   @default("OPEN")   // OPEN 或 CLOSED
+  openedAt         DateTime @db.Date
+  closedAt         DateTime? @db.Date
+
+  account           CashAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  stockTransactions StockTransaction[]
+}
+
+model Transfer {
+  id              Int      @id @default(autoincrement())
+  date            DateTime @db.Date
+  type            String   // 現金轉帳 / 換匯 / 股票轉移
+  fromAccountId   Int
+  toAccountId     Int
+  amount          Decimal? @db.Decimal(18, 6)
+  targetAmount    Decimal? @db.Decimal(18, 6) // 直接取代字串解析
+  ticker          String?
+  shares          Decimal? @db.Decimal(18, 6)
+  note            String?
+
+  fromAccount CashAccount @relation("TransferFrom", fields: [fromAccountId], references: [id], onDelete: Cascade)
+  toAccount   CashAccount @relation("TransferTo", fields: [toAccountId], references: [id], onDelete: Cascade)
+}
+
+// ── 企業事件與快照 ────────────────────────────────────────
+
+model StockCorporateAction {
+  id          Int      @id @default(autoincrement())
+  ticker      String
+  actionDate  DateTime @db.Date
+  actionType  String   // SPLIT / CONSOLIDATION
+  ratio       Decimal  @db.Decimal(12, 6)
+  note        String?
+}
+
+model NetWorthSnapshot {
+  id          Int      @id @default(autoincrement())
+  userId      String   @db.Uuid
+  date        DateTime @db.Date
+  netWorth    Decimal  @db.Decimal(18, 4) // 以 baseCurrency 計價的總淨值
+  scopeType   String   // total / bank / account
+  accountId   Int?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account     CashAccount? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}

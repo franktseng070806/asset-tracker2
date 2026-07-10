@@ -1,17 +1,13 @@
 // src/lib/prisma.ts
 import { PrismaClient } from '@prisma/client'
 
-const prismaClientSingleton = () => {
-  return new PrismaClient()
-}
+// 宣告一個全域變數來暫存 Prisma 實例，避免在開發環境重複連線
+const globalForPrisma = global as unknown as { prisma: PrismaClient }
 
-declare global {
-  var prismaGlobal: undefined | ReturnType<typeof prismaClientSingleton>
-}
+// 🛡️ 核心關鍵：裡面「完全不傳」任何參數！
+// Prisma 會在系統正式運行、第一次發送 Query 時，才自動去深層讀取 DATABASE_URL
+export const prisma = globalForPrisma.prisma || new PrismaClient()
 
-// 在開發環境下使用全域變數保留實例，避免熱更新導致連線數爆掉
-const prisma = globalThis.prismaGlobal ?? prismaClientSingleton()
+if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma
 
 export default prisma
-
-if (process.env.NODE_ENV !== 'production') globalThis.prismaGlobal = prisma

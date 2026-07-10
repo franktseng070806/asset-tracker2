@@ -2,8 +2,14 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import yahooFinance from 'yahoo-finance2'
+import { headers } from 'next/headers' // 👈 引入防護罩套件
+
 export const dynamic = 'force-dynamic'
+
 export async function GET(request: Request) {
+  // 🛡️ 終極防護盾：呼叫 headers()，強迫 Next.js 徹底放棄在編譯期偷跑這支 API！
+  headers()
+
   // 1. 安全防護：確認呼叫者帶有正確的密鑰
   const authHeader = request.headers.get('authorization')
   if (process.env.NODE_ENV === 'production' && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -11,10 +17,6 @@ export async function GET(request: Request) {
   }
 
   try {
-    // ==========================================
-    // [Part 1: 股票行情同步 (統一使用 Yahoo Finance)]
-    // ==========================================
-    
     // 從資料庫撈出所有「有交易紀錄」的股票代號
     const txTickers = await prisma.stockTransaction.findMany({ 
       select: { ticker: true, assetCurrency: true }, 
@@ -31,7 +33,6 @@ export async function GET(request: Request) {
         if (quote && quote.regularMarketPrice) {
           const price = quote.regularMarketPrice
           
-          // 更新或建立快取
           await prisma.marketQuote.upsert({
             where: { ticker },
             update: { currentPrice: price, lastUpdatedAt: new Date(), dataSource: 'YAHOO' },
@@ -40,15 +41,9 @@ export async function GET(request: Request) {
         }
       } catch (err) {
         console.error(`Failed to fetch quote for ${ticker}:`, err)
-        // 繼續執行下一檔，不中斷
       }
     }
 
-    // ==========================================
-    // [Part 2: 外匯交叉匯率同步]
-    // ==========================================
-    
-    // 動態掃描系統中所有涉及的幣別
     const accounts = await prisma.cashAccount.findMany({ select: { currency: true }, distinct: ['currency'] })
     const users = await prisma.user.findMany({ select: { baseCurrency: true }, distinct: ['baseCurrency'] })
     
@@ -59,7 +54,7 @@ export async function GET(request: Request) {
     ]))
 
     for (const curr of allCurrencies) {
-      if (curr === 'USD') continue // USD 對 USD 不需抓取
+      if (curr === 'USD') continue 
       
       try {
         const quote = await yahooFinance.quote(`USD${curr}=X`) as any
@@ -67,14 +62,12 @@ export async function GET(request: Request) {
         if (quote && quote.regularMarketPrice) {
            const rate = quote.regularMarketPrice
            
-           // 儲存 USD -> 目標幣別
            await prisma.exchangeRate.upsert({
              where: { fromCurrency_toCurrency: { fromCurrency: 'USD', toCurrency: curr } },
              update: { rate },
              create: { fromCurrency: 'USD', toCurrency: curr, rate }
            })
 
-           // 同步儲存 目標幣別 -> USD (倒數計算)
            await prisma.exchangeRate.upsert({
              where: { fromCurrency_toCurrency: { fromCurrency: curr, toCurrency: 'USD' } },
              update: { rate: 1 / rate },

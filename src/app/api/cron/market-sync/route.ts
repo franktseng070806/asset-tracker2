@@ -2,7 +2,7 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import yahooFinance from 'yahoo-finance2'
-
+export const dynamic = 'force-dynamic'
 export async function GET(request: Request) {
   // 1. 安全防護：確認呼叫者帶有正確的密鑰
   const authHeader = request.headers.get('authorization')

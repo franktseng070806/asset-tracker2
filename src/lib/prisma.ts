@@ -4,9 +4,9 @@ import { PrismaPg } from '@prisma/adapter-pg'
 const globalForPrisma = global as unknown as { prisma: PrismaClient }
 
 function createPrismaClient() {
-  const adapter = new PrismaPg({
-    connectionString: process.env.DATABASE_URL ?? '',
-  })
+ const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL, // pooler, 6543
+})
   return new PrismaClient({ adapter })
 }
 

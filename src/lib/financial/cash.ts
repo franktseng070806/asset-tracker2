@@ -1,74 +1,100 @@
 // src/lib/financial/cash.ts
 import prisma from '@/lib/prisma'
+import { Prisma } from '@prisma/client'
+
+type CashTx = Prisma.CashTransactionGetPayload<{}>
+type StockTx = Prisma.StockTransactionGetPayload<{ include: { marginLoan: true } }>
+type TransferTx = Prisma.TransferGetPayload<{}>
 
 /**
- * 計算單一交割帳戶的即時現金餘額
- * 支援跨幣別交割：股票總價 = (price * shares * settlementFxRate) + fee
+ * 核心運算：給定單一帳戶的交易資料，算出現金餘額
+ * 拆成純函式方便單一帳戶版本與批次版本共用同一套邏輯
  */
-export async function calculateAccountBalance(accountId: number): Promise<number> {
-  // 1. 取得一般出入金流水 (CashTransactions)
-  const cashTx = await prisma.cashTransaction.findMany({
-    where: { accountId }
-  })
-  
-  // 計算出入金淨額：入金為正，出金為負
+function computeBalanceFromTx(
+  accountId: number,
+  cashTx: CashTx[],
+  stockTx: StockTx[],
+  transfersOut: TransferTx[],
+  transfersIn: TransferTx[]
+): number {
+  // 1. 一般出入金流水
   const cashFlow = cashTx.reduce((sum, tx) => {
     const amount = Number(tx.amount)
-    // 假設 type 為 'DEPOSIT' (入金) / 'INITIAL' (期初) 是加項，'WITHDRAWAL' (出金) 是減項
     return tx.type === 'WITHDRAWAL' ? sum - amount : sum + amount
   }, 0)
 
-  // 2. 取得股票交割流水 (StockTransactions)
-  const stockTx = await prisma.stockTransaction.findMany({
-    where: { accountId },
-    include: { marginLoan: true } // 一併拉取融資資料
-  })
-
-  // 計算股票交割淨額 (扣款或入帳)
+  // 2. 股票交割流水
   const stockFlow = stockTx.reduce((sum, tx) => {
     const price = Number(tx.price)
     const shares = Number(tx.shares)
     const fxRate = Number(tx.settlementFxRate)
     const fee = Number(tx.fee)
-
-    // 跨幣別計算核心：總額 = 原生幣別總價 * 交割匯率
     const grossAmount = price * shares * fxRate
 
     if (tx.tradeType === 'CASH') {
-      // 現股交易
       if (tx.action === 'BUY' || tx.action === 'INITIAL') {
-        return sum - (grossAmount + fee) // 買入扣款
+        return sum - (grossAmount + fee)
       } else if (tx.action === 'SELL') {
-        return sum + (grossAmount - fee) // 賣出入帳
+        return sum + (grossAmount - fee)
       }
     } else if (tx.tradeType === 'MARGIN' && tx.marginLoan) {
-      // 融資交易：交割帳戶只扣除「自備款」與「手續費」
       const selfPaid = Number(tx.marginLoan.selfPaidAmount)
       if (tx.action === 'BUY') {
-         return sum - (selfPaid + fee)
+        return sum - (selfPaid + fee)
       } else if (tx.action === 'SELL') {
-         // 融資賣出：交割帳戶入帳 = 賣出總額 - 手續費 - 償還券商借款本息
-         const loanAmount = Number(tx.marginLoan.loanAmount)
-         const accruedInterest = Number(tx.marginLoan.accruedInterest)
-         return sum + (grossAmount - fee - loanAmount - accruedInterest)
+        const loanAmount = Number(tx.marginLoan.loanAmount)
+        const accruedInterest = Number(tx.marginLoan.accruedInterest)
+        return sum + (grossAmount - fee - loanAmount - accruedInterest)
       }
     }
     return sum
   }, 0)
 
-  // 3. 取得轉帳與換匯流水 (Transfers)
-  // 轉出 (做為 fromAccount)
-  const transfersOut = await prisma.transfer.findMany({
-    where: { fromAccountId: accountId }
-  })
+  // 3. 轉帳與換匯流水
   const transferOutFlow = transfersOut.reduce((sum, tx) => sum - Number(tx.amount || 0), 0)
-
-  // 轉入 (做為 toAccount)
-  const transfersIn = await prisma.transfer.findMany({
-    where: { toAccountId: accountId }
-  })
   const transferInFlow = transfersIn.reduce((sum, tx) => sum + Number(tx.targetAmount || tx.amount || 0), 0)
 
-  // 4. 結算最終餘額
   return cashFlow + stockFlow + transferOutFlow + transferInFlow
+}
+
+/**
+ * 🚀 批次計算【多個帳戶】的即時現金餘額
+ * 一次用 accountId IN [...] 撈出所有相關交易，避免每個帳戶各自查 4 次資料庫
+ * 回傳 Map<accountId, balance>
+ */
+export async function calculateAllAccountBalances(accountIds: number[]): Promise<Map<number, number>> {
+  if (accountIds.length === 0) return new Map()
+
+  const [allCashTx, allStockTx, allTransfersOut, allTransfersIn] = await Promise.all([
+    prisma.cashTransaction.findMany({ where: { accountId: { in: accountIds } } }),
+    prisma.stockTransaction.findMany({
+      where: { accountId: { in: accountIds } },
+      include: { marginLoan: true }
+    }),
+    prisma.transfer.findMany({ where: { fromAccountId: { in: accountIds } } }),
+    prisma.transfer.findMany({ where: { toAccountId: { in: accountIds } } }),
+  ])
+
+  const result = new Map<number, number>()
+
+  for (const accountId of accountIds) {
+    const cashTx = allCashTx.filter(tx => tx.accountId === accountId)
+    const stockTx = allStockTx.filter(tx => tx.accountId === accountId)
+    const transfersOut = allTransfersOut.filter(tx => tx.fromAccountId === accountId)
+    const transfersIn = allTransfersIn.filter(tx => tx.toAccountId === accountId)
+
+    result.set(accountId, computeBalanceFromTx(accountId, cashTx, stockTx, transfersOut, transfersIn))
+  }
+
+  return result
+}
+
+/**
+ * 計算單一交割帳戶的即時現金餘額
+ * 保留給只需要算「單一帳戶」的場景使用（例如新增一筆交易後即時重算該帳戶）
+ * 內部邏輯與批次版本共用同一套 computeBalanceFromTx
+ */
+export async function calculateAccountBalance(accountId: number): Promise<number> {
+  const balances = await calculateAllAccountBalances([accountId])
+  return balances.get(accountId) ?? 0
 }

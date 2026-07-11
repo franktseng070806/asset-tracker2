@@ -2,77 +2,273 @@ import Navbar from '@/components/Navbar'
 import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 import prisma from '@/lib/prisma'
-import { generateDailySnapshots } from '@/lib/financial/netWorth'
+import { calculateAllAccountBalances } from '@/lib/financial/cash'
+import { calculateAllAccountHoldings } from '@/lib/financial/stocks'
+import { calculateAllMarginStatus, type MarketQuoteInfo } from '@/lib/financial/margin'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import AssetChart from '@/components/AssetChart'
 
 export default async function DashboardPage() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
+  if (!user) redirect('/login')
 
-  if (!user) {
-    redirect('/login')
-  }
-
-  // 1. 檢查使用者是否已在 Prisma 中建檔，若無則自動建立 (預設基準幣別 TWD)
   let dbUser = await prisma.user.findUnique({ where: { id: user.id } })
   if (!dbUser) {
-    dbUser = await prisma.user.create({
-      data: {
-        id: user.id,
-        email: user.email!,
-        baseCurrency: 'TWD', 
-      }
-    })
+    dbUser = await prisma.user.create({ data: { id: user.id, email: user.email!, baseCurrency: 'TWD' } })
+  }
+  const baseCurrency = dbUser.baseCurrency
+
+  const banks = await prisma.bank.findMany({
+    where: { userId: user.id },
+    include: { accounts: true }
+  })
+
+  const allAccounts = banks.flatMap(b => b.accounts.map(a => ({ ...a, bankName: b.name })))
+  const accountIds = allAccounts.map(a => a.id)
+
+  // 🚀 一次性撈取報價、匯率、餘額、持股、融資，之後全部在記憶體中組合計算
+  // 取代過去「每個帳戶、每筆持股、每筆融資都各自查一次資料庫」的寫法
+  const [quotes, rates, balances, holdingsMap] = await Promise.all([
+    prisma.marketQuote.findMany(),
+    prisma.exchangeRate.findMany(),
+    calculateAllAccountBalances(accountIds),
+    calculateAllAccountHoldings(accountIds),
+  ])
+
+  const quotesMap = new Map<string, MarketQuoteInfo>(
+    quotes.map(q => [q.ticker, { currentPrice: Number(q.currentPrice), currency: q.currency }])
+  )
+  const ratesMap = new Map<string, number>(
+    rates.map(r => [`${r.fromCurrency}_${r.toCurrency}`, Number(r.rate)])
+  )
+  const marginsMap = await calculateAllMarginStatus(accountIds, quotesMap, ratesMap)
+
+  function getFx(from: string, to: string): number {
+    if (from === to) return 1
+    return ratesMap.get(`${from}_${to}`) ?? 1
   }
 
-  // 2. 呼叫 Phase 2 打造的無敵結算引擎！
-  // 這裡會自動計算所有現金、股票、融資，並換算回 TWD
-  const totalNetWorth = await generateDailySnapshots(user.id)
+  const holdingsList = []
+  const marginLoansList = []
+  const chartData: { name: string, value: number }[] = []
+  let totalNetWorth = 0
+  let totalInvestedBase = 0
+  let totalUnrealizedBase = 0
+
+  for (const acc of allAccounts) {
+    // 1. 現金聚合
+    const cash = balances.get(acc.id) ?? 0
+    const cashFx = getFx(acc.currency, baseCurrency)
+    const cashValueInBase = cash * cashFx
+    totalNetWorth += cashValueInBase
+
+    if (cash > 0) {
+      chartData.push({ name: `現金 (${acc.currency})`, value: cashValueInBase })
+    }
+
+    // 2. 持股明細與行情聚合
+    const holdings = holdingsMap.get(acc.id) ?? []
+    for (const h of holdings) {
+      const quote = quotesMap.get(h.ticker)
+      const currentPrice = quote ? quote.currentPrice : h.avgCost
+      const fx = getFx(h.assetCurrency, baseCurrency)
+
+      const totalCostBase = (h.avgCost * h.shares) * fx
+      const marketValueBase = (currentPrice * h.shares) * fx
+      const unrealizedBase = marketValueBase - totalCostBase
+
+      totalInvestedBase += totalCostBase
+      totalUnrealizedBase += unrealizedBase
+      totalNetWorth += marketValueBase
+
+      holdingsList.push({
+        ticker: h.ticker,
+        currency: h.assetCurrency,
+        shares: h.shares,
+        avgCost: h.avgCost,
+        currentPrice,
+        unrealized: (currentPrice - h.avgCost) * h.shares,
+        returnRate: ((currentPrice - h.avgCost) / h.avgCost) * 100
+      })
+
+      chartData.push({ name: h.ticker, value: marketValueBase })
+    }
+
+    // 3. 融資借款狀態與維持率追蹤
+    const marginStatuses = marginsMap.get(acc.id) ?? []
+    for (const m of marginStatuses) {
+      const loanFx = getFx(m.loanCurrency, baseCurrency)
+      totalNetWorth -= m.totalDebt * loanFx
+
+      marginLoansList.push({
+        ...m,
+        bankName: acc.bankName
+      })
+    }
+  }
+
+  const hasMarginAlert = marginLoansList.some(m => m.maintenanceRatio > 0 && m.maintenanceRatio < 140)
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-slate-50 pb-12">
       <Navbar />
-      
+
       <main className="max-w-6xl mx-auto p-6 space-y-6">
+        {hasMarginAlert && (
+          <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded-md shadow-sm animate-pulse">
+            <div className="flex">
+              <div className="flex-shrink-0">⚠️</div>
+              <div className="ml-3">
+                <h3 className="text-sm font-bold text-red-800">高風險資產警告：融資維持率過低！</h3>
+                <p className="text-xs text-red-700 mt-1">您有融資合約之維持率已逼近 130% 斷頭線，請密切注意市場波動或適時補繳保證金。</p>
+              </div>
+            </div>
+          </div>
+        )}
+
         <header className="mb-8">
           <h1 className="text-3xl font-bold text-slate-900">早安！您的資產總覽</h1>
-          <p className="text-slate-500 mt-2">這裡是您所有投資與帳戶的最新狀態。</p>
         </header>
-        
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* 總資產淨值卡片 */}
           <Card className="border-t-4 border-t-emerald-500 shadow-sm">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-slate-500 uppercase tracking-wider">
-                總資產淨值 ({dbUser.baseCurrency})
-              </CardTitle>
-            </CardHeader>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-slate-500">總資產淨值 ({baseCurrency})</CardTitle></CardHeader>
             <CardContent>
               <p className="text-4xl font-bold text-slate-900">
-                ${totalNetWorth.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+                ${totalNetWorth.toLocaleString(undefined, { maximumFractionDigits: 0 })}
               </p>
             </CardContent>
           </Card>
-          
-          {/* 預留給未來擴充的卡片 */}
+
           <Card className="shadow-sm">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-slate-500 uppercase tracking-wider">總投入本金</CardTitle>
-            </CardHeader>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-slate-500">總投入成本 ({baseCurrency})</CardTitle></CardHeader>
             <CardContent>
-              <p className="text-2xl font-semibold text-slate-400">尚無資料</p>
+              <p className="text-2xl font-semibold text-slate-700">
+                ${totalInvestedBase.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </p>
             </CardContent>
           </Card>
 
           <Card className="shadow-sm">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-slate-500 uppercase tracking-wider">未實現損益</CardTitle>
-            </CardHeader>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-slate-500">未實現損益 ({baseCurrency})</CardTitle></CardHeader>
             <CardContent>
-              <p className="text-2xl font-semibold text-slate-400">尚無資料</p>
+              <p className={`text-2xl font-semibold ${totalUnrealizedBase >= 0 ? 'text-red-500' : 'text-green-500'}`}>
+                {totalUnrealizedBase > 0 ? '+' : ''}${totalUnrealizedBase.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </p>
             </CardContent>
           </Card>
         </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
+          <Card className="lg:col-span-1 shadow-sm">
+            <CardHeader><CardTitle className="text-lg">資產分佈</CardTitle></CardHeader>
+            <CardContent><AssetChart data={chartData} /></CardContent>
+          </Card>
+
+          <Card className="lg:col-span-2 shadow-sm overflow-hidden">
+            <CardHeader><CardTitle className="text-lg">持股明細 (依標的原生幣別)</CardTitle></CardHeader>
+            <CardContent className="p-0">
+              {holdingsList.length === 0 ? (
+                <div className="p-6 text-center text-slate-400">尚無持股紀錄</div>
+              ) : (
+                <Table>
+                  <TableHeader className="bg-slate-50">
+                    <TableRow>
+                      <TableHead>標的</TableHead>
+                      <TableHead className="text-right">股數</TableHead>
+                      <TableHead className="text-right">均價 / 現價</TableHead>
+                      <TableHead className="text-right">未實現損益</TableHead>
+                      <TableHead className="text-right">報酬率</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {holdingsList.map((h, i) => (
+                      <TableRow key={i}>
+                        <TableCell className="font-bold">{h.ticker} <span className="text-xs text-slate-400 font-normal ml-1">{h.currency}</span></TableCell>
+                        <TableCell className="text-right">{h.shares.toLocaleString()}</TableCell>
+                        <TableCell className="text-right">
+                          <div className="text-xs text-slate-400">均 {h.avgCost.toFixed(2)}</div>
+                          <div className="font-medium">現 {h.currentPrice.toFixed(2)}</div>
+                        </TableCell>
+                        <TableCell className={`text-right font-medium ${h.unrealized >= 0 ? 'text-red-500' : 'text-green-500'}`}>
+                          {h.unrealized > 0 ? '+' : ''}{h.unrealized.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                        </TableCell>
+                        <TableCell className={`text-right font-medium ${h.returnRate >= 0 ? 'text-red-500' : 'text-green-500'}`}>
+                          {h.returnRate > 0 ? '+' : ''}{h.returnRate.toFixed(2)}%
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {marginLoansList.length > 0 && (
+          <Card className="shadow-sm mt-6 border-t-4 border-t-amber-500">
+            <CardHeader>
+              <CardTitle className="text-lg flex items-center gap-2">🛡️ 融資槓桿監控面板</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader className="bg-slate-50">
+                  <TableRow>
+                    <TableHead>機構 / 標的</TableHead>
+                    <TableHead className="text-right">融資股數</TableHead>
+                    <TableHead className="text-right">借款本金</TableHead>
+                    <TableHead className="text-right">擔保品市值</TableHead>
+                    <TableHead className="text-right">即時維持率</TableHead>
+                    <TableHead className="text-center">風險狀態</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {marginLoansList.map((m, i) => {
+                    let ratioColor = 'text-green-600 font-bold'
+                    let statusBadge = 'bg-green-100 text-green-800'
+                    let statusText = '安全'
+
+                    if (m.maintenanceRatio < 130) {
+                      ratioColor = 'text-red-600 font-black animate-bounce'
+                      statusBadge = 'bg-red-600 text-white font-bold'
+                      statusText = '處分斷頭'
+                    } else if (m.maintenanceRatio < 140) {
+                      ratioColor = 'text-red-500 font-bold'
+                      statusBadge = 'bg-red-100 text-red-800'
+                      statusText = '追繳警告'
+                    } else if (m.maintenanceRatio < 160) {
+                      ratioColor = 'text-amber-500 font-semibold'
+                      statusBadge = 'bg-amber-100 text-amber-800'
+                      statusText = '注意觀察'
+                    }
+
+                    return (
+                      <TableRow key={i}>
+                        <TableCell>
+                          <div className="font-semibold">{m.ticker}</div>
+                          <div className="text-xs text-slate-400">{m.bankName}</div>
+                        </TableCell>
+                        <TableCell className="text-right">{m.loanShares.toLocaleString()} 股</TableCell>
+                        <TableCell className="text-right">{m.loanAmount.toLocaleString()} {m.loanCurrency}</TableCell>
+                        <TableCell className="text-right">{m.marketValue.toLocaleString(undefined, { maximumFractionDigits: 0 })} {m.loanCurrency}</TableCell>
+                        <TableCell className={`text-right ${ratioColor}`}>
+                          {m.maintenanceRatio > 0 ? `${m.maintenanceRatio.toFixed(1)}%` : '計算中'}
+                        </TableCell>
+                        <TableCell className="text-center">
+                          <span className={`text-xs px-2 py-1 rounded-full font-medium ${statusBadge}`}>
+                            {statusText}
+                          </span>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
       </main>
     </div>
   )
